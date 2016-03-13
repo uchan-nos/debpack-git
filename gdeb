@@ -1,0 +1,200 @@
+#!/usr/bin/python3
+
+import argparse
+import configparser
+from glob import glob
+import os
+from subprocess import check_output, check_call, call
+import sys
+
+
+def get_current_branch():
+    '''get_current_branch returns name of the current branch.'''
+    out = check_output(['git', 'branch'])
+    for line in out.decode().splitlines():
+        if line.startswith('*'):
+            return line[2:]
+    raise RuntimeError('Could not get the name of the current branch')
+
+
+def find_base_commit(a, b):
+    '''find_base_commit returns an ID of a base commit of both a and b.'''
+    out = check_output(['git', 'merge-base', a, b])
+    return out.decode().strip()
+
+
+def checkout(obj):
+    '''checkout switches to a given object (commit or branch).'''
+    check_call(['git', 'checkout', '-q', obj])
+
+
+def debian_control_exists():
+    '''debian_files_exist returns True if debian/control exists.'''
+    return os.path.exists('debian/control')
+
+
+def get_upstream_version():
+    '''get_upstream_version parses debian/changelog
+    and returns upstream version string.'''
+    out = check_output(['dpkg-parsechangelog', '--show-field', 'Version'])
+    version_str = out.decode().strip()
+    elems = version_str.split('-', maxsplit=1)
+    if len(elems) == 1 or len(elems) == 2:
+        return elems[0]
+    raise RuntimeError('Failed to parse version: ' + version_str)
+
+
+def get_package_name():
+    '''get_package_name parses debian/changelog and returns the package name.'''
+    out = check_output(['dpkg-parsechangelog', '--show-field', 'Source'])
+    return out.decode().strip()
+
+
+def get_tar_extension(tarball_path):
+    '''get_tar_extension returns extension string of tarball file path.
+    ex) "tar.gz" or "tgz".'''
+    elems = tarball_path.rsplit('.', maxsplit=2)
+    if len(elems) < 2:
+        return None
+    elif elems[-2] == 'tar':
+        return '.'.join(elems[-2:])
+    else:
+        return elems[-1]
+
+
+def make_tarball(conf):
+    '''make_tarball executes 'make tarball' command.
+    If it fails, then this function will use 'tar' instead.'''
+    ret = call(['make', 'tarball'])
+    if ret != 0:
+        # get a list of files controlled by git
+        out = check_output(['git', 'ls-tree', '--name-only', '-r', 'HEAD'])
+        files = out.decode().splitlines()
+        # create a tarball containing all files except the debian directory
+        check_call(['tar', 'czf', '../{}-{}.tar.gz'.format(name, ver), '--exclude', 'debian'] + files)
+
+
+def rename_tarball(name, upstream_version):
+    # find a path to a tarball
+    expect_path = '../{}-{}.*'.format(name, upstream_version)
+    archive_paths = glob(expect_path)
+    if len(archive_paths) == 0:
+        raise RuntimeError('No such archive: ' + expect_path)
+
+    # rename the tarball so that debian packaging system can recognize it
+    ext = get_tar_extension(archive_paths[0])
+    orig_path = '../{}_{}.orig.{}'.format(name, upstream_version, ext)
+    os.rename(archive_paths[0], orig_path)
+
+
+def create_orig_tarball(conf):
+    '''create_orig_tarball creates tarball of the upstream sources.
+
+    This function first switches to a commit which is the base of both
+    the current branch and the upstream branch, then creates a tarball.'''
+    if not debian_control_exists():
+        raise RuntimeError('No such file: debian/control')
+
+    name = get_package_name()
+    ver = get_upstream_version()
+
+    # save the current branch and switch to the base commit
+    original_branch = get_current_branch()
+    upstream_branch = conf['DEFAULT']['upstream-branch']
+    base_commit = find_base_commit(original_branch, upstream_branch)
+    checkout(base_commit)
+
+    try:
+        make_tarball(conf)
+        rename_tarball(name, ver)
+    finally:
+        checkout(original_branch)
+
+
+def get_git_directory_path():
+    '''get_git_directory_path returns a path to the '.git' directory.'''
+    out = check_output(['git', 'rev-parse', '--show-toplevel'])
+    return out.decode().strip()
+
+
+def read_config():
+    '''read_config returns a set of configuration read from a file: '.git/gdeb.conf'.
+    If it doesn't exist, this function returns default values.'''
+    defaults = {
+        'upstream-branch': 'master',
+        'debian-branch': 'debian'
+    }
+    conf = configparser.ConfigParser(defaults)
+
+    conf_path = os.path.join(get_git_directory_path(), 'gdeb.conf')
+    if os.path.exists(conf_path):
+        conf.read(conf_path)
+
+    return conf
+
+
+def cmd_buildpackage(ns, conf):
+    '''cmd_buildpackage executes dpkg-buildpackage with given arguments.'''
+    create_orig_tarball(conf)
+    check_call(['dpkg-buildpackage'] + ns.args)
+
+
+def cmd_pdebuild(ns, conf):
+    '''cmd_pdebuild executes pdebuild with given arguments.'''
+    create_orig_tarball(conf)
+    check_call(['pdebuild'] + ns.args)
+
+
+def cmd_cowdebuild(ns, conf):
+    '''cmd_cowdebuild executes pdebuild --pbuilder cowbuilder
+    with given arguments.'''
+    ns.args = ['--pbuilder', 'cowbuilder'] + ns.args
+    cmd_pdebuild(ns, conf)
+
+
+def cmd_createorig(ns, conf):
+    pass
+
+
+DESCRIPTION = '''\
+%(prog)s is a tool to build debian packages on a git repository.
+
+%(prog)s creates a tarball automatically from an upstream branch,
+which is needed by the debian packaging system.
+'''
+
+def main():
+    parser = argparse.ArgumentParser(description=DESCRIPTION)
+    sps = parser.add_subparsers(
+        description='commands for building package, creating tarball, etc.',
+        metavar='SUBCOMMAND')
+
+    createorig_parser = sps.add_parser(
+        'createorig', help='create a tarball of upstream sources')
+    createorig_parser.set_defaults(func=cmd_createorig)
+
+    buildpackage_parser = sps.add_parser(
+        'buildpackage', help='execute dpkg-buildpackage command')
+    buildpackage_parser.add_argument(
+        'args', nargs='...', help='arguments for dpkg-buildpackage')
+    buildpackage_parser.set_defaults(func=cmd_buildpackage)
+
+    pdebuild_parser = sps.add_parser(
+        'pdebuild', help='execute pdebuild command')
+    pdebuild_parser.add_argument(
+        'args', nargs='...', help='arguments for pdebuild')
+    pdebuild_parser.set_defaults(func=cmd_pdebuild)
+
+    cowdebuild_parser = sps.add_parser(
+        'cowdebuild', help='execute pdebuild command with "--pbuilder cowbuilder"')
+    cowdebuild_parser.add_argument(
+        'args', nargs='...', help='arguments for pdebuild')
+    cowdebuild_parser.set_defaults(func=cmd_cowdebuild)
+
+    ns = parser.parse_args()
+    conf = read_config()
+    ns.func(ns, conf)
+
+
+if __name__ == '__main__':
+    main()
